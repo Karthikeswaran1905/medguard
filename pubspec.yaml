@@ -1,0 +1,77 @@
+name: medguard
+description: "MedGuard — Smart Medication Adherence, Monitoring & Escalation System."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # Backend: Firebase
+  firebase_core: ^3.6.0
+  firebase_auth: ^5.3.0
+  cloud_firestore: ^5.4.0
+  cloud_functions: ^5.1.0
+  firebase_messaging: ^15.1.0
+  # Prescription scan images + health record documents (Section: Health
+  # Record Vault, Prescription Scanner in the MedGuardian AI feature scope)
+  firebase_storage: ^12.3.2
+
+  # Simple, explicit state management for role-scoped app state
+  provider: ^6.1.2
+
+  # Date/time formatting and timezone-aware scheduling (Section 41)
+  intl: ^0.19.0
+
+  # Invite codes, local ids
+  uuid: ^4.5.1
+
+  # Camera/gallery capture for the Prescription Scanner screen
+  image_picker: ^1.1.2
+
+  # Emergency QR Health Card
+  qr_flutter: ^4.1.0
+
+  # @visibleForTesting on FirebaseService.debugOverride (lib/data/firebase_client.dart)
+  # — ships transitively via the Flutter SDK already, but the analyzer wants
+  # anything imported directly (`package:meta/meta.dart`) listed explicitly
+  # rather than relied on as a transitive dependency. Pinned to ^1.18.0,
+  # not the newer 1.19.0 on pub.dev: this Flutter SDK's own flutter_test
+  # pins meta to exactly 1.18.0, so anything higher makes `pub get` refuse
+  # to resolve (per its own suggested fix).
+  meta: ^1.18.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+
+  # Test doubles for the repository/critical-flow tests under test/unit and
+  # test/flows — an in-memory Firestore and a mock FirebaseAuth so those
+  # tests exercise PeopleRepository/MedicationRepository/AnalyticsRepository
+  # for real without touching a live project or needing the (Node-based,
+  # out of scope for this pass) Firebase Emulator Suite. Versions pinned to
+  # the ^5.x/^3.x cloud_firestore/firebase_auth/firebase_core line above —
+  # see the header comment in test/flows/critical_flows_test.dart for why,
+  # and for what this pass of tests does NOT cover.
+  fake_cloud_firestore: ^3.1.0
+  firebase_auth_mocks: ^0.14.1
+
+flutter:
+  uses-material-design: true
+
+  # The official MedGuard logo (shield + care team + pill + clock/bell),
+  # used on the splash screen (lib/features/splash/splash_screen.dart) and
+  # anywhere else in the app that wants the brand mark. The Android
+  # launcher icon and native launch screen use their own copies of the
+  # same source image under android/app/src/main/res/ instead of this
+  # asset — those are platform resources, not something Dart code loads.
+  assets:
+    - assets/branding/

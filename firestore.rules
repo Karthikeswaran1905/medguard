@@ -1,0 +1,296 @@
+// MedGuard — Firestore Security Rules.
+//
+// This is the real authorization boundary (replacing the Postgres Row
+// Level Security policies from Section 46 of the architecture report):
+// Section 28 states it outright — "never rely only on Flutter buttons for
+// authorization."
+//
+// Unlike Postgres RLS, a `get()`/`exists()` call inside these rules does
+// NOT re-run this file against the document being read — so there is no
+// analog to the RLS-recursion bug the original Supabase migration had to
+// work around with `security definer` functions. Every helper below is a
+// plain read.
+//
+// Cloud Functions run with the Admin SDK and bypass these rules entirely
+// (Section 39/48) — that's intentional and is how `linkPatient`,
+// `scheduleGenerator`, `escalationEngine`, `sendNotification` and
+// `aiInsightsBatch` are allowed to write documents no client rule below
+// permits a signed-in user to write directly. Cloud Functions require
+// Firebase's Blaze plan, though — on a Spark (free) project none of them
+// can be deployed at all. `createStaffUser` is the one exception: staff
+// account creation (Admin -> Doctor -> Incharge -> Caretaker, Section 39)
+// is done straight from the client instead (`PeopleRepository
+// .createStaffAccount`), which is why `canCreateStaffRole()` below exists
+// — it's the client-write equivalent of that Cloud Function's own
+// `ALLOWED_CREATION` check, now enforced here instead of server-side.
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+
+    function myProfile() {
+      return get(/databases/$(database)/documents/profiles/$(uid())).data;
+    }
+    function myRole() { return isSignedIn() ? myProfile().role : null; }
+    function myOrgId() { return isSignedIn() ? myProfile().orgId : null; }
+    function isAdmin() { return isSignedIn() && myRole() == 'admin'; }
+
+    // Client-side staff creation (see the file header comment) — mirrors
+    // the management chain in Section 11: admin -> doctor -> incharge ->
+    // caretaker. `role` is the *target* role of the account being created.
+    function canCreateStaffRole(role) {
+      return isSignedIn() && (
+        (myRole() == 'admin' && role == 'doctor') ||
+        (myRole() == 'doctor' && role == 'incharge') ||
+        (myRole() == 'incharge' && role == 'caretaker')
+      );
+    }
+
+    function assignmentExists(patientId) {
+      return exists(/databases/$(database)/documents/assignments/$(patientId));
+    }
+    function assignmentData(patientId) {
+      return get(/databases/$(database)/documents/assignments/$(patientId)).data;
+    }
+    function isAssignedCaretaker(patientId) {
+      return assignmentExists(patientId) && assignmentData(patientId).caretakerId == uid();
+    }
+    function isAssignedIncharge(patientId) {
+      return assignmentExists(patientId) && assignmentData(patientId).inchargeId == uid();
+    }
+    // doctor_patient_links documents are keyed `{doctorId}_{patientId}`
+    // (see lib/data/models/relationship_models.dart) so this is a direct
+    // get instead of a query.
+    function isLinkedDoctor(patientId) {
+      let linkId = uid() + '_' + patientId;
+      return exists(/databases/$(database)/documents/doctor_patient_links/$(linkId))
+        && get(/databases/$(database)/documents/doctor_patient_links/$(linkId)).data.status == 'active';
+    }
+    function canViewPatient(patientId) {
+      return patientId == uid()
+        || isAssignedCaretaker(patientId)
+        || isAssignedIncharge(patientId)
+        || isLinkedDoctor(patientId)
+        || isAdmin();
+    }
+
+    // ---------------------------------------------------------------------
+    // organizations — a user may only read/update their own org (Section 38).
+    // ---------------------------------------------------------------------
+    match /organizations/{orgId} {
+      allow read: if isSignedIn() && orgId == myOrgId();
+      allow update: if isAdmin() && orgId == myOrgId();
+    }
+
+    // ---------------------------------------------------------------------
+    // profiles — a user may only read/update their own document; anyone in
+    // the same org may also read it (Section 25, 28). The second `create`
+    // branch is an Admin/Doctor/Incharge writing a *new* profile for the
+    // Doctor/Incharge/Caretaker they just created client-side (see file
+    // header) — `profileId` won't be their own uid in that case, so this
+    // checks the caller is allowed to create that specific target role
+    // instead.
+    // ---------------------------------------------------------------------
+    match /profiles/{profileId} {
+      allow read: if isSignedIn() && (profileId == uid() || resource.data.orgId == myOrgId());
+      allow create: if isSignedIn() && (
+        profileId == uid() || canCreateStaffRole(request.resource.data.role)
+      );
+      allow update: if isSignedIn() && profileId == uid();
+    }
+
+    // ---------------------------------------------------------------------
+    // patients — patient (own), caretaker/incharge (assigned), doctor
+    // (linked), admin (org) — Section 25 permission matrix.
+    // ---------------------------------------------------------------------
+    match /patients/{patientId} {
+      allow read: if isSignedIn() && canViewPatient(patientId);
+      allow create: if isSignedIn() && patientId == uid();
+      allow update: if isSignedIn() && patientId == uid();
+    }
+
+    // ---------------------------------------------------------------------
+    // doctors / incharges / caretakers — readable by any signed-in user;
+    // each is only ever created by the caller one rung up its own chain
+    // (admin creates doctors, doctor creates incharges, incharge creates
+    // caretakers) as part of `PeopleRepository.createStaffAccount` writing
+    // this placeholder alongside the new profile — Section 39/48.
+    // ---------------------------------------------------------------------
+    match /doctors/{id} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && myRole() == 'admin';
+    }
+    match /incharges/{id} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && myRole() == 'doctor';
+    }
+    match /caretakers/{id} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && myRole() == 'incharge';
+    }
+
+    // ---------------------------------------------------------------------
+    // patient_invites — only the issuing doctor can read/write their own
+    // codes; redemption is validated server-side by `linkPatient`
+    // (Section 39, 48). Document id is the code itself.
+    // ---------------------------------------------------------------------
+    match /patient_invites/{code} {
+      allow read, update, delete: if isSignedIn() && resource.data.doctorId == uid();
+      allow create: if isSignedIn() && request.resource.data.doctorId == uid();
+    }
+
+    // ---------------------------------------------------------------------
+    // doctor_patient_links — visible to the doctor and the patient
+    // involved; writable only by `linkPatient` (Admin SDK).
+    // ---------------------------------------------------------------------
+    match /doctor_patient_links/{linkId} {
+      allow read: if isSignedIn() && (resource.data.doctorId == uid() || resource.data.patientId == uid());
+    }
+
+    // ---------------------------------------------------------------------
+    // assignments — Doctor creates/updates the inchargeId side, Incharge
+    // fills in caretakerId (Section 11); all three roles involved can read.
+    // Document id is the patient id (one assignment per patient).
+    // ---------------------------------------------------------------------
+    match /assignments/{patientId} {
+      allow read: if isSignedIn() && canViewPatient(patientId);
+      allow create: if isSignedIn() && isLinkedDoctor(patientId);
+      allow update: if isSignedIn() && (resource.data.inchargeId == uid() || isLinkedDoctor(patientId));
+    }
+
+    // ---------------------------------------------------------------------
+    // prescriptions / medicines / medication_schedules — insert only by the
+    // prescribing doctor (via doctor_patient_links); read by patient (own),
+    // caretaker/incharge (assigned), doctor (own), admin (org) — Section 25.
+    // ---------------------------------------------------------------------
+    match /prescriptions/{prescriptionId} {
+      allow read: if isSignedIn() && canViewPatient(resource.data.patientId);
+      allow create: if isSignedIn()
+        && request.resource.data.doctorId == uid()
+        && isLinkedDoctor(request.resource.data.patientId);
+    }
+
+    match /medicines/{medicineId} {
+      allow read: if isSignedIn() && canViewPatient(
+        get(/databases/$(database)/documents/prescriptions/$(resource.data.prescriptionId)).data.patientId
+      );
+      allow create: if isSignedIn() && get(
+        /databases/$(database)/documents/prescriptions/$(request.resource.data.prescriptionId)
+      ).data.doctorId == uid();
+    }
+
+    match /medication_schedules/{scheduleId} {
+      allow read: if isSignedIn() && canViewPatient(resource.data.patientId);
+      allow create: if isSignedIn() && isLinkedDoctor(request.resource.data.patientId);
+    }
+
+    // ---------------------------------------------------------------------
+    // medication_events — the most sensitive collection (Section 46 spells
+    // this out explicitly).
+    //   Patient   create/update: only their own events (patientId ==
+    //             uid()) — the client-side `ensureTodayEvents` convenience
+    //             path (see MedicationRepository) as well as confirming a
+    //             dose both go through this rule.
+    //   Caretaker update: only on events for patients they're assigned to.
+    //   `escalationLevel`/full server-side creation is otherwise owned by
+    //   `scheduleGenerator`/`escalationEngine` (Admin SDK, bypasses rules).
+    // ---------------------------------------------------------------------
+    match /medication_events/{eventId} {
+      allow read: if isSignedIn() && canViewPatient(resource.data.patientId);
+      allow create: if isSignedIn() && request.resource.data.patientId == uid();
+      allow update: if isSignedIn() && (
+        resource.data.patientId == uid() || isAssignedCaretaker(resource.data.patientId)
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // escalation_policies — readable by everyone in the org; writable only
+    // by Admin (Section 40).
+    // ---------------------------------------------------------------------
+    match /escalation_policies/{id} {
+      allow read: if isSignedIn() && (resource.data.orgId == null || resource.data.orgId == myOrgId());
+      allow create, update, delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------------------
+    // family_contacts — patient (own view), caretaker/incharge (view),
+    // incharge (manage) — Section 25.
+    // ---------------------------------------------------------------------
+    match /family_contacts/{id} {
+      allow read: if isSignedIn() && canViewPatient(resource.data.patientId);
+      allow create: if isSignedIn() && isAssignedIncharge(request.resource.data.patientId);
+    }
+
+    // ---------------------------------------------------------------------
+    // device_tokens — a user manages only their own token.
+    // ---------------------------------------------------------------------
+    match /device_tokens/{id} {
+      allow read, update, delete: if isSignedIn() && resource.data.userId == uid();
+      allow create: if isSignedIn() && request.resource.data.userId == uid();
+    }
+
+    // ---------------------------------------------------------------------
+    // notifications — written by Cloud Functions (Admin SDK); read by
+    // their target user.
+    // ---------------------------------------------------------------------
+    match /notifications/{id} {
+      allow read: if isSignedIn() && resource.data.targetUserId == uid();
+    }
+
+    // ---------------------------------------------------------------------
+    // prescription_scans — Prescription Scanner -> OCR Review drafts
+    // (MedGuardian AI feature scope). Patient owns their own scans;
+    // anyone who can view the patient (their linked Doctor, assigned
+    // Caretaker/Incharge, Admin) can read them too, so a scan a patient
+    // submits is actually visible to whoever might act on it.
+    // ---------------------------------------------------------------------
+    match /prescription_scans/{id} {
+      allow read: if isSignedIn() && canViewPatient(resource.data.patientId);
+      allow create: if isSignedIn() && request.resource.data.patientId == uid();
+      allow update: if isSignedIn() && resource.data.patientId == uid();
+    }
+
+    // ---------------------------------------------------------------------
+    // health_records — Health Record Vault (MedGuardian AI SUPPORT
+    // feature). Same read/write shape as prescription_scans: patient owns
+    // their documents, canViewPatient governs read access for whoever is
+    // monitoring them.
+    // ---------------------------------------------------------------------
+    match /health_records/{id} {
+      allow read: if isSignedIn() && canViewPatient(resource.data.patientId);
+      allow create: if isSignedIn() && request.resource.data.patientId == uid();
+      allow delete: if isSignedIn() && resource.data.patientId == uid();
+    }
+
+    // ---------------------------------------------------------------------
+    // ai_insights — read-only to the app; written only by
+    // `aiInsightsBatch` (Admin SDK) — Section 44.
+    // ---------------------------------------------------------------------
+    match /ai_insights/{id} {
+      allow read: if isSignedIn() && (
+        resource.data.scopeId == uid()
+        || isAssignedCaretaker(resource.data.scopeId)
+        || isAssignedIncharge(resource.data.scopeId)
+        || isAdmin()
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // audit_logs — readable by Admin only; every other entry is written by
+    // a Cloud Function (Admin SDK). The one client-side write is
+    // `staff_account_created`, logged by `createStaffAccount` itself right
+    // after it creates the profile — scoped narrowly to that one action so
+    // this doesn't become a general client write hole into audit_logs.
+    // ---------------------------------------------------------------------
+    match /audit_logs/{id} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn()
+        && request.resource.data.actorId == uid()
+        && request.resource.data.action == 'staff_account_created';
+    }
+  }
+}

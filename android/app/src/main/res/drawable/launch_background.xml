@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MedGuard native launch screen: shown instantly when the app icon is
+     tapped, before the Flutter engine has even started — replaced by the
+     branded lib/features/splash/splash_screen.dart the moment Flutter
+     draws its first frame, and by AuthGate shortly after that. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@android:color/white" />
+
+    <item>
+        <bitmap
+            android:gravity="center"
+            android:src="@drawable/launch_logo" />
+    </item>
+</layer-list>

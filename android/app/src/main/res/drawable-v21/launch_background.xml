@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MedGuard native launch screen (API 21+ variant) — see the default
+     drawable/launch_background.xml for the full explanation. Hardcoded to
+     white here too (rather than ?android:colorBackground) so the launch
+     screen always matches the logo's own white background regardless of
+     system dark/light theme. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@android:color/white" />
+
+    <item>
+        <bitmap
+            android:gravity="center"
+            android:src="@drawable/launch_logo" />
+    </item>
+</layer-list>

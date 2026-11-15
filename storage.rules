@@ -1,0 +1,65 @@
+// MedGuard — Firebase Storage Security Rules.
+//
+// Backs two features: the Prescription Scanner (image uploads at
+// prescription_scans/{patientId}/...) and the Health Record Vault
+// (health_records/{patientId}/...). Both paths encode the owning
+// patient's uid as the first segment, so the rule for each is: the
+// patient can read/write their own folder, and anyone Firestore's
+// `canViewPatient` would let read that patient's data can also read
+// (never write) it here — enforced via `firestore.get()`, the same cross
+// -service access Cloud Functions already rely on, mirroring
+// `firestore.rules`'s own `canViewPatient` helper without duplicating its
+// full definition (Storage rules can't import Firestore rules directly).
+//
+// Requires the Blaze plan — already required for Cloud Functions
+// (functions/), so this introduces no new billing tier.
+
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+
+    function myProfile() {
+      return firestore.get(/databases/(default)/documents/profiles/$(uid())).data;
+    }
+    function isAdmin() { return isSignedIn() && myProfile().role == 'admin'; }
+
+    function assignmentExists(patientId) {
+      return firestore.exists(/databases/(default)/documents/assignments/$(patientId));
+    }
+    function assignmentData(patientId) {
+      return firestore.get(/databases/(default)/documents/assignments/$(patientId)).data;
+    }
+    function isAssignedCaretaker(patientId) {
+      return assignmentExists(patientId) && assignmentData(patientId).caretakerId == uid();
+    }
+    function isAssignedIncharge(patientId) {
+      return assignmentExists(patientId) && assignmentData(patientId).inchargeId == uid();
+    }
+    function isLinkedDoctor(patientId) {
+      let linkId = uid() + '_' + patientId;
+      return firestore.exists(/databases/(default)/documents/doctor_patient_links/$(linkId))
+        && firestore.get(/databases/(default)/documents/doctor_patient_links/$(linkId)).data.status == 'active';
+    }
+    function canViewPatient(patientId) {
+      return patientId == uid()
+        || isAssignedCaretaker(patientId)
+        || isAssignedIncharge(patientId)
+        || isLinkedDoctor(patientId)
+        || isAdmin();
+    }
+
+    match /prescription_scans/{patientId}/{fileName} {
+      allow read: if isSignedIn() && canViewPatient(patientId);
+      allow write: if isSignedIn() && patientId == uid();
+    }
+
+    match /health_records/{patientId}/{fileName} {
+      allow read: if isSignedIn() && canViewPatient(patientId);
+      allow write, delete: if isSignedIn() && patientId == uid();
+    }
+  }
+}
