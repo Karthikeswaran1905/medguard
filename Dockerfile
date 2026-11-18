@@ -21,7 +21,7 @@ RUN curl -fL \
     && rm /tmp/flutter.tar.xz
 
 ENV PATH="/opt/flutter/bin:/opt/flutter/bin/cache/dart-sdk/bin:${PATH}"
-
+RUN git config --global --add safe.directory /opt/flutter
 WORKDIR /app
 
 COPY pubspec.* ./
